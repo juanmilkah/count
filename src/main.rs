@@ -6,7 +6,7 @@ use std::{env, fs};
 
 use anyhow::Context;
 
-/// File contents information
+/// File contents information for a single file
 #[derive(Debug, Default)]
 struct FileStats {
     /// Total number of lines
@@ -22,32 +22,103 @@ struct FileStats {
     blanks: u64,
 }
 
-struct Aggregate {
-    /// The Language based HashMap
-    /// FileStats and File Count for a specific language
-    map: HashMap<String, (FileStats, u64)>,
+/// Information about a specific language
+#[derive(Debug, Default)]
+struct LanguageStats {
+    /// Accumulated statistics across all files
+    stats: FileStats,
+
+    /// Number of files for this language
+    file_count: u64,
 }
 
-impl Aggregate {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
+/// Manages all statistics for the program
+#[derive(Debug)]
+struct StatisticsManager {
+    /// Language-specific statistics
+    language_stats: HashMap<String, LanguageStats>,
 
-    fn add(&mut self, lang: String, stats: FileStats) {
-        let lang_stats = self.map.entry(lang).or_default();
-        lang_stats.0.blanks += stats.blanks;
-        lang_stats.0.comments += stats.comments;
-        lang_stats.0.code += stats.code;
-        lang_stats.0.lines += stats.lines;
-        lang_stats.1 += 1;
-    }
+    /// File extension to language mapping
+    extension_map: HashMap<String, String>,
+
+    /// Processors for different file types
+    processors: HashMap<String, fn(&Path) -> anyhow::Result<FileStats>>,
 }
 
 impl FileStats {
+    fn add(&mut self, stats: FileStats) {
+        self.blanks += stats.blanks;
+        self.comments += stats.comments;
+        self.lines += stats.lines;
+        self.code += stats.code;
+    }
+}
+
+impl LanguageStats {
+    fn add(&mut self, stats: FileStats) {
+        self.stats.add(stats);
+        self.file_count += 1;
+    }
+}
+
+impl StatisticsManager {
     fn new() -> Self {
-        Self::default()
+        let mut manager = Self {
+            language_stats: HashMap::new(),
+            extension_map: HashMap::new(),
+            processors: HashMap::new(),
+        };
+
+        //extensions
+        manager
+            .extension_map
+            .insert("md".to_string(), "Markdown".to_string());
+
+        //processors
+        manager
+            .processors
+            .insert("md".to_string(), process_markdown_file);
+
+        manager
+    }
+
+    fn process_file(&mut self, filepath: &Path) -> anyhow::Result<()> {
+        if let Some(ext) = filepath.extension().and_then(|e| e.to_str()) {
+            if let Some(processor) = self.processors.get(ext) {
+                let stats = processor(filepath)?;
+                if let Some(lang) = self.extension_map.get(ext) {
+                    let lang_stats = self.language_stats.entry(lang.to_string()).or_default();
+                    lang_stats.add(stats);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn print_statistics(&self) {
+        println!("LANGUAGE  FILES    CODE    COMMENTS   BLANKS  TOTAL LINES");
+        println!("{}", "*".repeat(58));
+
+        for (lang, stats) in &self.language_stats {
+            println!(
+                "{lang}:   {}  {}  {}  {}   {}",
+                stats.file_count,
+                stats.stats.code,
+                stats.stats.comments,
+                stats.stats.blanks,
+                stats.stats.lines
+            );
+        }
+
+        println!("TOTAL FILES:  {}", self.total_files());
+    }
+
+    fn total_files(&self) -> u64 {
+        self.language_stats
+            .values()
+            .map(|stats| stats.file_count)
+            .sum()
     }
 }
 
@@ -86,7 +157,7 @@ fn read_dir_recursively(dir_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
 fn process_markdown_file(filepath: &Path) -> anyhow::Result<FileStats> {
     let content = read_file_content(filepath)?;
 
-    let mut stats = FileStats::new();
+    let mut stats = FileStats::default();
 
     for line in content.lines() {
         if line.is_empty() {
@@ -116,7 +187,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut files = Vec::new();
-    let mut global_stats = Aggregate::new();
+    let mut global_stats = StatisticsManager::new();
 
     // process args
     for filepath in args {
@@ -131,32 +202,10 @@ fn main() -> anyhow::Result<()> {
 
     // make this parallel later on
     for file in &files {
-        let (lang, stats) = if let Some(ext) = file.extension() {
-            match ext.to_str() {
-                Some("md") => (Some("Markdown"), process_markdown_file(file)?),
-                _ => (None, FileStats::new()),
-            }
-        } else {
-            // Files that start with "." fall in this else statement
-            (None, FileStats::new())
-        };
-
-        if let Some(lang) = lang {
-            global_stats.add(lang.to_string(), stats);
-        }
+        global_stats.process_file(file)?;
     }
 
-    {
-        for (lang, stats) in &global_stats.map {
-            println!("LANGUAGE  FILES    CODE    COMMENTS   BLANKS  TOTAL LINES");
-            println!(
-                "{lang}:   {}  {}  {}  {}   {}",
-                stats.1, stats.0.code, stats.0.comments, stats.0.blanks, stats.0.lines
-            );
-        }
-        let total_files = global_stats.map.keys().count();
-        println!("TOTAL FILES:  {total_files}");
-    }
+    global_stats.print_statistics();
 
     Ok(())
 }
