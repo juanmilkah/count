@@ -2,9 +2,12 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
 use anyhow::Context;
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator;
 
 /// File contents information for a single file
 #[derive(Debug, Default)]
@@ -82,18 +85,23 @@ impl StatisticsManager {
         manager
     }
 
-    fn process_file(&mut self, filepath: &Path) -> anyhow::Result<()> {
+    fn process_file(&mut self, filepath: &Path) {
         if let Some(ext) = filepath.extension().and_then(|e| e.to_str()) {
             if let Some(processor) = self.processors.get(ext) {
-                let stats = processor(filepath)?;
+                let stats = match processor(filepath) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return;
+                    }
+                };
+
                 if let Some(lang) = self.extension_map.get(ext) {
                     let lang_stats = self.language_stats.entry(lang.to_string()).or_default();
                     lang_stats.add(stats);
                 }
             }
         }
-
-        Ok(())
     }
 
     fn print_statistics(&self) {
@@ -165,6 +173,12 @@ fn process_markdown_file(filepath: &Path) -> anyhow::Result<FileStats> {
             stats.lines += 1;
             continue;
         }
+
+        // there ain't a clear way to comment in markdown files
+        // there are several workarounds
+        if line.starts_with("<!--") && line.ends_with("-->") {
+            stats.comments += 1;
+        }
         stats.code += 1;
         stats.lines += 1;
     }
@@ -187,7 +201,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut files = Vec::new();
-    let mut global_stats = StatisticsManager::new();
+    let global_stats = Arc::new(Mutex::new(StatisticsManager::new()));
 
     // process args
     for filepath in args {
@@ -200,12 +214,12 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // make this parallel later on
-    for file in &files {
-        global_stats.process_file(file)?;
-    }
+    files.par_iter().for_each(|file| {
+        let mut stats = global_stats.lock().unwrap();
+        stats.process_file(file);
+    });
 
-    global_stats.print_statistics();
+    global_stats.lock().unwrap().print_statistics();
 
     Ok(())
 }
